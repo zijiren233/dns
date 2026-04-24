@@ -25,7 +25,8 @@ type cnameTargetRule struct {
 	paramFromTarget string
 	paramToTarget   string
 	nextAction      string
-	Upstream        UpstreamInt // Upstream for looking up external names during the resolution process.
+	pattern         *regexp.Regexp // Compiled paramFromTarget regex for RegexMatch
+	Upstream        UpstreamInt    // Upstream for looking up external names during the resolution process.
 }
 
 // cnameTargetRuleWithReqState is cname target rewrite rule state
@@ -44,16 +45,15 @@ func (r *cnameTargetRule) getFromAndToTarget(inputCName string) (from string, to
 			return inputCName, r.paramToTarget + after
 		}
 	case SuffixMatch:
-		if strings.HasSuffix(inputCName, r.paramFromTarget) {
-			return inputCName, strings.TrimSuffix(inputCName, r.paramFromTarget) + r.paramToTarget
+		if before, ok := strings.CutSuffix(inputCName, r.paramFromTarget); ok {
+			return inputCName, before + r.paramToTarget
 		}
 	case SubstringMatch:
 		if strings.Contains(inputCName, r.paramFromTarget) {
 			return inputCName, strings.ReplaceAll(inputCName, r.paramFromTarget, r.paramToTarget)
 		}
 	case RegexMatch:
-		pattern := regexp.MustCompile(r.paramFromTarget)
-		regexGroups := pattern.FindStringSubmatch(inputCName)
+		regexGroups := r.pattern.FindStringSubmatch(inputCName)
 		if len(regexGroups) == 0 {
 			return "", ""
 		}
@@ -91,21 +91,21 @@ func (r *cnameTargetRuleWithReqState) RewriteResponse(res *dns.Msg, rr dns.RR) {
 				}
 
 				var newAnswer []dns.RR
-				// iterate over first upstram response
+				// iterate over first upstream response
 				// add the cname record to the new answer
 				for _, rr := range res.Answer {
 					if cname, ok := rr.(*dns.CNAME); ok {
-						// change the target name in the response
-						cname.Target = toTarget
+						// preserve CNAME records until the rewrite target
 						newAnswer = append(newAnswer, rr)
+						if cname.Target == fromTarget {
+							// change the target name in the response
+							cname.Target = toTarget
+							break
+						}
 					}
 				}
-				// iterate over upstream response received
-				for _, rr := range upRes.Answer {
-					if rr.Header().Name == toTarget {
-						newAnswer = append(newAnswer, rr)
-					}
-				}
+				// add the upstream response to the new answer
+				newAnswer = append(newAnswer, upRes.Answer...)
 				res.Answer = newAnswer
 				// if not propagated, the truncated response might get cached,
 				// and it will be impossible to resolve the full response
@@ -142,6 +142,16 @@ func newCNAMERule(nextAction string, args ...string) (Rule, error) {
 		paramToTarget:   paramToTarget,
 		nextAction:      nextAction,
 		Upstream:        upstream.New(),
+	}
+	if rewriteType == RegexMatch {
+		if len(paramFromTarget) > maxRegexpLen {
+			return nil, fmt.Errorf("regex pattern too long in a cname rule: %d > %d", len(paramFromTarget), maxRegexpLen)
+		}
+		re, err := regexp.Compile(paramFromTarget)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cname rewrite regex pattern: %w", err)
+		}
+		rule.pattern = re
 	}
 	return &rule, nil
 }

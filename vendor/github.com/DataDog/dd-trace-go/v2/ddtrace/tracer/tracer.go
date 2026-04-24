@@ -26,7 +26,9 @@ import (
 	appsecConfig "github.com/DataDog/dd-trace-go/v2/internal/appsec/config"
 	"github.com/DataDog/dd-trace-go/v2/internal/datastreams"
 	"github.com/DataDog/dd-trace-go/v2/internal/globalconfig"
+	"github.com/DataDog/dd-trace-go/v2/internal/llmobs"
 	"github.com/DataDog/dd-trace-go/v2/internal/log"
+	"github.com/DataDog/dd-trace-go/v2/internal/processtags"
 	"github.com/DataDog/dd-trace-go/v2/internal/remoteconfig"
 	"github.com/DataDog/dd-trace-go/v2/internal/samplernames"
 	"github.com/DataDog/dd-trace-go/v2/internal/telemetry"
@@ -51,6 +53,7 @@ type TracerConf struct { //nolint:revive
 	VersionTag           string
 	ServiceTag           string
 	TracingAsTransport   bool
+	isLambdaFunction     bool
 }
 
 // Tracer specifies an implementation of the Datadog tracer which allows starting
@@ -160,6 +163,16 @@ type tracer struct {
 
 	// runtimeMetrics is submitting runtime metrics to the agent using statsd.
 	runtimeMetrics *runtimemetrics.Emitter
+
+	// telemetry is the telemetry client for the tracer.
+	telemetry telemetry.Client
+
+	// State related to the Dynamic Instrumentation product.
+	dynInstMu struct {
+		sync.Mutex
+		ldSubscriptionToken    remoteconfig.SubscriptionToken
+		symDBSubscriptionToken remoteconfig.SubscriptionToken
+	}
 }
 
 const (
@@ -184,10 +197,20 @@ const (
 // statsd client; replaced in tests.
 var statsInterval = 10 * time.Second
 
+// startStopMu ensures that calling Start and Stop concurrently doesn't leak
+// goroutines. In particular, without this lock TestTracerCleanStop will leak
+// goroutines from the internal telemetry client.
+//
+// TODO: The entire Start/Stop code should be refactored, it's pretty gnarly.
+var startStopMu sync.Mutex
+
 // Start starts the tracer with the given set of options. It will stop and replace
 // any running tracer, meaning that calling it several times will result in a restart
 // of the tracer by replacing the current instance with a new one.
 func Start(opts ...StartOption) error {
+	startStopMu.Lock()
+	defer startStopMu.Unlock()
+
 	defer func(now time.Time) {
 		telemetry.Distribution(telemetry.NamespaceGeneral, "init_time", nil).Submit(float64(time.Since(now).Milliseconds()))
 	}(time.Now())
@@ -200,11 +223,13 @@ func Start(opts ...StartOption) error {
 		// if tracing is disabled, but we still want to capture this
 		// telemetry information. Will be fixed when the tracer and profiler
 		// share control of the global telemetry client.
+		t.Stop()
 		return nil
 	}
-	setGlobalTracer(t)
-	if t.config.logStartup {
-		logStartup(t)
+	if t.config.internalConfig.CIVisibilityEnabled() && t.config.ciVisibilityNoopTracer {
+		setGlobalTracer(wrapWithCiVisibilityNoopTracer(t))
+	} else {
+		setGlobalTracer(t)
 	}
 	if t.dataStreams != nil {
 		t.dataStreams.Start()
@@ -214,17 +239,27 @@ func Start(opts ...StartOption) error {
 
 		// start instrumentation telemetry unless it is disabled through the
 		// DD_INSTRUMENTATION_TELEMETRY_ENABLED env var
-		startTelemetry(t.config)
+		t.telemetry = startTelemetry(t.config)
 
 		globalinternal.SetTracerInitialized(true)
 		return nil
 	}
 
+	if t.config.internalConfig.RuntimeMetricsV2Enabled() {
+		l := slog.New(slogHandler{})
+		opts := &runtimemetrics.Options{Logger: l}
+		if t.runtimeMetrics, err = runtimemetrics.NewEmitter(t.statsd, opts); err == nil {
+			l.Debug("Runtime metrics v2 enabled.")
+		} else {
+			l.Error("Failed to enable runtime metrics v2", "err", err.Error())
+		}
+	}
+
 	// Start AppSec with remote configuration
 	cfg := remoteconfig.DefaultClientConfig()
 	cfg.AgentURL = t.config.agentURL.String()
-	cfg.AppVersion = t.config.version
-	cfg.Env = t.config.env
+	cfg.AppVersion = t.config.internalConfig.Version()
+	cfg.Env = t.config.internalConfig.Env()
 	cfg.HTTP = t.config.httpClient
 	cfg.ServiceName = t.config.serviceName
 	if err := t.startRemoteConfig(cfg); err != nil {
@@ -240,32 +275,48 @@ func Start(opts ...StartOption) error {
 
 	appsec.Start(appsecopts...)
 
+	if t.config.llmobs.Enabled {
+		if err := llmobs.Start(t.config.llmobs, &llmobsTracerAdapter{}); err != nil {
+			return fmt.Errorf("failed to start llmobs: %w", err)
+		}
+	}
+	if t.config.internalConfig.LogStartup() {
+		logStartup(t)
+	}
+
 	// start instrumentation telemetry unless it is disabled through the
 	// DD_INSTRUMENTATION_TELEMETRY_ENABLED env var
-	startTelemetry(t.config)
+	t.telemetry = startTelemetry(t.config)
 
-	// store the configuration in an in-memory file, allowing it to be read to
-	// determine if the process is instrumented with a tracer and to retrive
-	// relevant tracing information.
+	// store the configuration in an in-memory file and in a named anonymous mapping,
+	// allowing it to be read to determine if the process is instrumented with a tracer
+	// and to retrieve relevant tracing information.
 	storeConfig(t.config)
 
 	globalinternal.SetTracerInitialized(true)
 	return nil
 }
 
+// storeConfig stores the process level tracing context both in an in-memory file and
+// in a named anonymous mapping.
+// This allows an external process, such as the Datadog Agent or fullhost profiler,
+// to determine if the process is instrumented with a tracer and to retrieve the process
+// level tracing context.
 func storeConfig(c *config) {
 	uuid, _ := uuid.NewRandom()
 	name := fmt.Sprintf("datadog-tracer-info-%s", uuid.String()[0:8])
 
 	metadata := Metadata{
-		SchemaVersion:      1,
+		SchemaVersion:      2,
 		RuntimeID:          globalconfig.RuntimeID(),
 		Language:           "go",
 		Version:            version.Tag,
-		Hostname:           c.hostname,
+		Hostname:           c.internalConfig.Hostname(),
 		ServiceName:        c.serviceName,
-		ServiceEnvironment: c.env,
-		ServiceVersion:     c.version,
+		ServiceEnvironment: c.internalConfig.Env(),
+		ServiceVersion:     c.internalConfig.Version(),
+		ProcessTags:        processtags.GlobalTags().String(),
+		ContainerID:        globalinternal.ContainerID(),
 	}
 
 	data, _ := metadata.MarshalMsg(nil)
@@ -273,10 +324,31 @@ func storeConfig(c *config) {
 	if err != nil {
 		log.Error("failed to store the configuration: %s", err.Error())
 	}
+
+	processContext := otelProcessContext{
+		DeploymentEnvironmentName: c.internalConfig.Env(),
+		HostName:                  c.internalConfig.Hostname(),
+		ServiceInstanceID:         globalconfig.RuntimeID(),
+		ServiceName:               c.serviceName,
+		ServiceVersion:            c.internalConfig.Version(),
+		TelemetrySDKLanguage:      "go",
+		TelemetrySDKVersion:       version.Tag,
+		TelemetrySdkName:          "dd-trace-go",
+	}
+
+	data, _ = processContext.MarshalMsg(nil)
+	err = globalinternal.CreateOtelProcessContextMapping(data)
+	if err != nil {
+		log.Error("failed to store the OTEL process context: %s", err.Error())
+	}
 }
 
 // Stop stops the started tracer. Subsequent calls are valid but become no-op.
 func Stop() {
+	startStopMu.Lock()
+	defer startStopMu.Unlock()
+
+	llmobs.Stop()
 	setGlobalTracer(&NoopTracer{})
 	globalinternal.SetTracerInitialized(false)
 	log.Flush()
@@ -317,7 +389,7 @@ func SetUser(s *Span, id string, opts ...UserMonitoringOption) {
 // payloadQueueSize is the buffer size of the trace channel.
 const payloadQueueSize = 1000
 
-func newUnstartedTracer(opts ...StartOption) (*tracer, error) {
+func newUnstartedTracer(opts ...StartOption) (t *tracer, err error) {
 	c, err := newConfig(opts...)
 	if err != nil {
 		return nil, err
@@ -326,12 +398,18 @@ func newUnstartedTracer(opts ...StartOption) (*tracer, error) {
 	statsd, err := newStatsdClient(c)
 	if err != nil {
 		log.Error("Runtime and health metrics disabled: %s", err.Error())
-		return nil, fmt.Errorf("could not initialize statsd client: %s", err.Error())
+		// We are not failing here because the error could be cause by
+		// a transitory issue.
 	}
+	defer func() {
+		if err != nil {
+			statsd.Close()
+		}
+	}()
 	var writer traceWriter
-	if c.ciVisibilityEnabled {
+	if c.internalConfig.CIVisibilityEnabled() {
 		writer = newCiVisibilityTraceWriter(c)
-	} else if c.logToStdout {
+	} else if c.internalConfig.LogToStdout() {
 		writer = newLogTraceWriter(c, statsd)
 	} else {
 		writer = newAgentTraceWriter(c, sampler, statsd)
@@ -348,30 +426,30 @@ func newUnstartedTracer(opts ...StartOption) (*tracer, error) {
 		c.spanRules = spans
 	}
 
-	rulesSampler := newRulesSampler(c.traceRules, c.spanRules, c.globalSampleRate, c.traceRateLimitPerSecond)
-	c.traceSampleRate = newDynamicConfig("trace_sample_rate", c.globalSampleRate, rulesSampler.traces.setGlobalSampleRate, equal[float64])
+	rulesSampler := newRulesSampler(c.traceRules, c.spanRules, c.internalConfig.GlobalSampleRate(), c.internalConfig.TraceRateLimitPerSecond())
+	c.traceSampleRate = newDynamicConfig("trace_sample_rate", c.internalConfig.GlobalSampleRate(), rulesSampler.traces.setGlobalSampleRate, equal[float64])
 	// If globalSampleRate returns NaN, it means the environment variable was not set or valid.
 	// We could always set the origin to "env_var" inconditionally, but then it wouldn't be possible
 	// to distinguish between the case where the environment variable was not set and the case where
 	// it default to NaN.
-	if !math.IsNaN(c.globalSampleRate) {
+	if !math.IsNaN(c.internalConfig.GlobalSampleRate()) {
 		c.traceSampleRate.cfgOrigin = telemetry.OriginEnvVar
 	}
 	c.traceSampleRules = newDynamicConfig("trace_sample_rules", c.traceRules,
 		rulesSampler.traces.setTraceSampleRules, EqualsFalseNegative)
 	var dataStreamsProcessor *datastreams.Processor
-	if c.dataStreamsMonitoringEnabled {
-		dataStreamsProcessor = datastreams.NewProcessor(statsd, c.env, c.serviceName, c.version, c.agentURL, c.httpClient)
+	if c.internalConfig.DataStreamsMonitoringEnabled() {
+		dataStreamsProcessor = datastreams.NewProcessor(statsd, c.internalConfig.Env(), c.serviceName, c.internalConfig.Version(), c.agentURL, c.httpClient)
 	}
 	var logFile *log.ManagedFile
-	if v := c.logDirectory; v != "" {
+	if v := c.internalConfig.LogDirectory(); v != "" {
 		logFile, err = log.OpenFileAtPath(v)
 		if err != nil {
 			log.Warn("%s", err.Error())
-			c.logDirectory = ""
+			c.internalConfig.SetLogDirectory("", telemetry.OriginCalculated)
 		}
 	}
-	t := &tracer{
+	t = &tracer{
 		config:           c,
 		traceWriter:      writer,
 		out:              make(chan *chunk, payloadQueueSize),
@@ -399,7 +477,7 @@ func newUnstartedTracer(opts ...StartOption) (*tracer, error) {
 	return t, nil
 }
 
-// newTracer creates a new no-op tracer for testing.
+// newTracer creates a new tracer and starts it.
 // NOTE: This function does NOT set the global tracer, which is required for
 // most finish span/flushing operations to work as expected. If you are calling
 // span.Finish and/or expecting flushing to work, you must call
@@ -411,7 +489,7 @@ func newTracer(opts ...StartOption) (*tracer, error) {
 	}
 	c := t.config
 	t.statsd.Incr("datadog.tracer.started", nil, 1)
-	if c.runtimeMetrics {
+	if c.internalConfig.RuntimeMetricsEnabled() {
 		log.Debug("Runtime metrics enabled.")
 		t.wg.Add(1)
 		go func() {
@@ -419,19 +497,10 @@ func newTracer(opts ...StartOption) (*tracer, error) {
 			t.reportRuntimeMetrics(defaultMetricsReportInterval)
 		}()
 	}
-	if c.runtimeMetricsV2 {
-		l := slog.New(slogHandler{})
-		opts := &runtimemetrics.Options{Logger: l}
-		if t.runtimeMetrics, err = runtimemetrics.NewEmitter(t.statsd, opts); err == nil {
-			l.Debug("Runtime metrics v2 enabled.")
-		} else {
-			l.Error("Failed to enable runtime metrics v2", "err", err.Error())
-		}
-	}
-	if c.debugAbandonedSpans {
+	if c.internalConfig.DebugAbandonedSpans() {
 		log.Info("Abandoned spans logs enabled.")
 		t.abandonedSpansDebugger = newAbandonedSpansDebugger()
-		t.abandonedSpansDebugger.Start(t.config.spanTimeout)
+		t.abandonedSpansDebugger.Start(t.config.internalConfig.SpanTimeout())
 	}
 	t.wg.Add(1)
 	go func() {
@@ -467,6 +536,7 @@ func Flush() {
 	if t := getGlobalTracer(); t != nil {
 		t.Flush()
 	}
+	llmobs.Flush()
 }
 
 // Flush triggers a flush and waits for it to complete.
@@ -669,6 +739,9 @@ func spanStart(operationName string, options ...StartSpanOption) *Span {
 
 	}
 	span.context = newSpanContext(span, context)
+	if pprofContext != nil {
+		setLLMObsPropagatingTags(pprofContext, span.context)
+	}
 	span.setMeta("language", "go")
 	// add tags from options
 	for k, v := range opts.Tags {
@@ -698,9 +771,11 @@ func (t *tracer) StartSpan(operationName string, options ...StartSpanOption) *Sp
 	if span.service == "" {
 		span.service = t.config.serviceName
 	}
-	span.noDebugStack = t.config.noDebugStack
-	if t.config.hostname != "" {
-		span.setMeta(keyHostname, t.config.hostname)
+
+	cfg := t.config.internalConfig
+	span.noDebugStack = !cfg.DebugStack()
+	if hostname := cfg.Hostname(); hostname != "" && cfg.ReportHostname() {
+		span.setMeta(keyHostname, hostname)
 	}
 	span.supportsEvents = t.config.agent.spanEventsAvailable
 
@@ -708,39 +783,34 @@ func (t *tracer) StartSpan(operationName string, options ...StartSpanOption) *Sp
 	for k, v := range t.config.globalTags.get() {
 		span.SetTag(k, v)
 	}
-	if t.config.serviceMappings != nil {
-		if newSvc, ok := t.config.serviceMappings[span.service]; ok {
-			span.service = newSvc
-		}
+
+	if newSvc, ok := cfg.ServiceMapping(span.service); ok {
+		span.service = newSvc
 	}
-	if t.config.version != "" {
+
+	if ver := cfg.Version(); ver != "" {
 		if t.config.universalVersion || (!t.config.universalVersion && span.service == t.config.serviceName) {
-			span.setMeta(ext.Version, t.config.version)
+			span.setMeta(ext.Version, ver)
 		}
 	}
-	if t.config.env != "" {
-		span.setMeta(ext.Environment, t.config.env)
+	if env := cfg.Env(); env != "" {
+		span.setMeta(ext.Environment, env)
 	}
 	if _, ok := span.context.SamplingPriority(); !ok {
 		// if not already sampled or a brand new trace, sample it
 		t.sample(span)
-	}
-	if t.config.serviceMappings != nil {
-		if newSvc, ok := t.config.serviceMappings[span.service]; ok {
-			span.service = newSvc
-		}
 	}
 	if log.DebugEnabled() {
 		// avoid allocating the ...interface{} argument if debug logging is disabled
 		log.Debug("Started Span: %v, Operation: %s, Resource: %s, Tags: %v, %v", //nolint:gocritic // Debug logging needs full span representation
 			span, span.name, span.resource, span.meta, span.metrics)
 	}
-	if t.config.profilerHotspots || t.config.profilerEndpoints {
+	if t.config.internalConfig.ProfilerHotspotsEnabled() || t.config.internalConfig.ProfilerEndpoints() {
 		t.applyPPROFLabels(span.pprofCtxRestore, span)
 	} else {
 		span.pprofCtxRestore = nil
 	}
-	if t.config.debugAbandonedSpans {
+	if t.config.internalConfig.DebugAbandonedSpans() {
 		select {
 		case t.abandonedSpansDebugger.In <- newAbandonedSpanCandidate(span, false):
 			// ok
@@ -769,15 +839,15 @@ func (t *tracer) applyPPROFLabels(ctx gocontext.Context, span *Span) {
 	// https://go-review.googlesource.com/c/go/+/574516 for more information.
 	labels := make([]string, 0, 3*2 /* 3 key value pairs */)
 	localRootSpan := span.Root()
-	if t.config.profilerHotspots && localRootSpan != nil {
+	if t.config.internalConfig.ProfilerHotspotsEnabled() && localRootSpan != nil {
 		localRootSpan.mu.RLock()
 		labels = append(labels, traceprof.LocalRootSpanID, strconv.FormatUint(localRootSpan.spanID, 10))
 		localRootSpan.mu.RUnlock()
 	}
-	if t.config.profilerHotspots {
+	if t.config.internalConfig.ProfilerHotspotsEnabled() {
 		labels = append(labels, traceprof.SpanID, strconv.FormatUint(span.spanID, 10))
 	}
-	if t.config.profilerEndpoints && localRootSpan != nil {
+	if t.config.internalConfig.ProfilerEndpoints() && localRootSpan != nil {
 		localRootSpan.mu.RLock()
 		if spanResourcePIISafe(localRootSpan) {
 			labels = append(labels, traceprof.TraceEndpoint, localRootSpan.resource)
@@ -827,6 +897,10 @@ func (t *tracer) Stop() {
 	if t.logFile != nil {
 		t.logFile.Close()
 	}
+	if t.telemetry != nil {
+		t.telemetry.Close()
+	}
+	t.config.httpClient.CloseIdleConnections()
 }
 
 // Inject uses the configured or default TextMap Propagator.
@@ -899,19 +973,21 @@ func (t *tracer) Extract(carrier interface{}) (*SpanContext, error) {
 }
 
 func (t *tracer) TracerConf() TracerConf {
+	pfEnabled, pfMin := t.config.internalConfig.PartialFlushEnabled()
 	return TracerConf{
 		CanComputeStats:      t.config.canComputeStats(),
 		CanDropP0s:           t.config.canDropP0s(),
-		DebugAbandonedSpans:  t.config.debugAbandonedSpans,
+		DebugAbandonedSpans:  t.config.internalConfig.DebugAbandonedSpans(),
 		Disabled:             !t.config.enabled.current,
-		PartialFlush:         t.config.partialFlushEnabled,
-		PartialFlushMinSpans: t.config.partialFlushMinSpans,
+		PartialFlush:         pfEnabled,
+		PartialFlushMinSpans: pfMin,
 		PeerServiceDefaults:  t.config.peerServiceDefaultsEnabled,
 		PeerServiceMappings:  t.config.peerServiceMappings,
-		EnvTag:               t.config.env,
-		VersionTag:           t.config.version,
+		EnvTag:               t.config.internalConfig.Env(),
+		VersionTag:           t.config.internalConfig.Version(),
 		ServiceTag:           t.config.serviceName,
 		TracingAsTransport:   t.config.tracingAsTransport,
+		isLambdaFunction:     t.config.internalConfig.IsLambdaFunction(),
 	}
 }
 

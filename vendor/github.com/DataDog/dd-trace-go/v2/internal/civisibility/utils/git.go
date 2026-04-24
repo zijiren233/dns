@@ -142,9 +142,9 @@ func execGit(commandType telemetry.CommandType, args ...string) (val []byte, err
 		defer func() {
 			durationInMs := time.Since(startTime).Milliseconds()
 			if err != nil {
-				log.Debug("civisibility.git.command [%s][%s][%dms]: git %s", commandType, err.Error(), durationInMs, strings.Join(args, " "))
+				log.Debug("civisibility.git.command [%s][%s][%dms]: git %s\n%s", commandType, err.Error(), durationInMs, strings.Join(args, " "), string(val))
 			} else {
-				log.Debug("civisibility.git.command [%s][%dms]: git %s", commandType, durationInMs, strings.Join(args, " "))
+				log.Debug("civisibility.git.command [%s][%dms]: git %s\n%s", commandType, durationInMs, strings.Join(args, " "), string(val))
 			}
 		}()
 	}
@@ -197,9 +197,9 @@ func execGitStringWithInput(commandType telemetry.CommandType, input string, arg
 		defer func() {
 			durationInMs := time.Since(startTime).Milliseconds()
 			if err != nil {
-				log.Debug("civisibility.git.command [%s][%s][%dms]: git %s", commandType, err.Error(), durationInMs, strings.Join(args, " "))
+				log.Debug("civisibility.git.command(input) [%s][%s][%dms]: git %s\n%s", commandType, err.Error(), durationInMs, strings.Join(args, " "), val)
 			} else {
-				log.Debug("civisibility.git.command [%s][%dms]: git %s", commandType, durationInMs, strings.Join(args, " "))
+				log.Debug("civisibility.git.command(input) [%s][%dms]: git %s\n%s", commandType, durationInMs, strings.Join(args, " "), val)
 			}
 		}()
 	}
@@ -260,6 +260,14 @@ func getLocalGitData() (localGitData, error) {
 			log.Debug("civisibility.git: setting permissions to git folder: %s", gitDir)
 			if out, err := execGitString(telemetry.GitAddPermissionCommandType, "config", "--global", "--add", "safe.directory", gitDir); err != nil {
 				log.Debug("civisibility.git: error while setting permissions to git folder: %s\n out: %s\n error: %s", gitDir, out, err.Error())
+			}
+			// if the git folder contains with a `/.git` then we also add permission to the parent.
+			if strings.HasSuffix(gitDir, "/.git") {
+				parentGitDir := strings.TrimSuffix(gitDir, "/.git")
+				log.Debug("civisibility.git: setting permissions to git folder: %s", parentGitDir)
+				if out, err := execGitString(telemetry.GitAddPermissionCommandType, "config", "--global", "--add", "safe.directory", parentGitDir); err != nil {
+					log.Debug("civisibility.git: error while setting permissions to git folder: %s\n out: %s\n error: %s", parentGitDir, out, err.Error())
+				}
 			}
 		} else {
 			log.Debug("civisibility.git: error getting the parent git folder.")
@@ -326,7 +334,7 @@ func fetchCommitData(commitSha string) (localCommitData, error) {
 	log.Debug("civisibility.fetchCommitData: checking if the repository is a shallow clone")
 	isAShallowClone, err := isAShallowCloneRepository()
 	if err != nil {
-		return commitData, fmt.Errorf("civisibility.fetchCommitData: error checking if the repository is a shallow clone: %s", err.Error())
+		return commitData, fmt.Errorf("civisibility.fetchCommitData: error checking if the repository is a shallow clone: %s", err)
 	}
 
 	// if the git repo is a shallow clone, we try to fecth the commit sha data
@@ -335,7 +343,7 @@ func fetchCommitData(commitSha string) (localCommitData, error) {
 		log.Debug("civisibility.fetchCommitData: checking the git version")
 		major, minor, patch, err := getGitVersion()
 		if err != nil {
-			return commitData, fmt.Errorf("civisibility.fetchCommitData: error getting the git version: %s", err.Error())
+			return commitData, fmt.Errorf("civisibility.fetchCommitData: error getting the git version: %s", err)
 		}
 		log.Debug("civisibility.fetchCommitData: git version: %d.%d.%d", major, minor, patch)
 		if major < 2 || (major == 2 && minor < 27) {
@@ -346,7 +354,7 @@ func fetchCommitData(commitSha string) (localCommitData, error) {
 		// let's get the remote name
 		remoteName, err := getRemoteName()
 		if err != nil {
-			return commitData, fmt.Errorf("civisibility.fetchCommitData: error getting the remote name: %s\n%s", err.Error(), remoteName)
+			return commitData, fmt.Errorf("civisibility.fetchCommitData: error getting the remote name: %s\n%s", err, remoteName)
 		}
 		if remoteName == "" {
 			// if the origin name is empty, we fallback to "origin"
@@ -366,7 +374,7 @@ func fetchCommitData(commitSha string) (localCommitData, error) {
 			"--no-write-fetch-head",
 			remoteName,
 			commitSha); fetchErr != nil {
-			return commitData, fmt.Errorf("civisibility.fetchCommitData: error: %s\n%s", fetchErr.Error(), fetchOutput)
+			return commitData, fmt.Errorf("civisibility.fetchCommitData: error: %s\n%s", fetchErr, fetchOutput)
 		}
 	}
 
@@ -419,7 +427,7 @@ func UnshallowGitRepository() (bool, error) {
 	log.Debug("civisibility.unshallow: checking if the repository is a shallow clone")
 	isAShallowClone, err := isAShallowCloneRepository()
 	if err != nil {
-		return false, fmt.Errorf("civisibility.unshallow: error checking if the repository is a shallow clone: %s", err.Error())
+		return false, fmt.Errorf("civisibility.unshallow: error checking if the repository is a shallow clone: %s", err)
 	}
 
 	// if the git repo is not a shallow clone, we can return early
@@ -432,7 +440,7 @@ func UnshallowGitRepository() (bool, error) {
 	log.Debug("civisibility.unshallow: the repository is a shallow clone, checking if there are more than one commit in the logs")
 	hasMoreThanOneCommits, err := hasTheGitLogHaveMoreThanOneCommits()
 	if err != nil {
-		return false, fmt.Errorf("civisibility.unshallow: error checking if the git log has more than one commit: %s", err.Error())
+		return false, fmt.Errorf("civisibility.unshallow: error checking if the git log has more than one commit: %s", err)
 	}
 
 	// if there are more than 1 commits, we can return early
@@ -445,7 +453,7 @@ func UnshallowGitRepository() (bool, error) {
 	log.Debug("civisibility.unshallow: checking the git version")
 	major, minor, patch, err := getGitVersion()
 	if err != nil {
-		return false, fmt.Errorf("civisibility.unshallow: error getting the git version: %s", err.Error())
+		return false, fmt.Errorf("civisibility.unshallow: error getting the git version: %s", err)
 	}
 	log.Debug("civisibility.unshallow: git version: %d.%d.%d", major, minor, patch)
 	if major < 2 || (major == 2 && minor < 27) {
@@ -459,7 +467,7 @@ func UnshallowGitRepository() (bool, error) {
 	// let's get the remote name
 	remoteName, err := getRemoteName()
 	if err != nil {
-		return false, fmt.Errorf("civisibility.unshallow: error getting the remote name: %s\n%s", err.Error(), remoteName)
+		return false, fmt.Errorf("civisibility.unshallow: error getting the remote name: %s\n%s", err, remoteName)
 	}
 	if remoteName == "" {
 		// if the origin name is empty, we fallback to "origin"
@@ -470,13 +478,13 @@ func UnshallowGitRepository() (bool, error) {
 	// let's get the sha of the HEAD (git rev-parse HEAD)
 	headSha, err := execGitString(telemetry.GetHeadCommandsType, "rev-parse", "HEAD")
 	if err != nil {
-		return false, fmt.Errorf("civisibility.unshallow: error getting the HEAD sha: %s\n%s", err.Error(), headSha)
+		return false, fmt.Errorf("civisibility.unshallow: error getting the HEAD sha: %s\n%s", err, headSha)
 	}
 	if headSha == "" {
 		// if the HEAD is empty, we fallback to the current branch (git branch --show-current)
 		headSha, err = execGitString(telemetry.GetBranchCommandsType, "branch", "--show-current")
 		if err != nil {
-			return false, fmt.Errorf("civisibility.unshallow: error getting the current branch: %s\n%s", err.Error(), headSha)
+			return false, fmt.Errorf("civisibility.unshallow: error getting the current branch: %s\n%s", err, headSha)
 		}
 	}
 	log.Debug("civisibility.unshallow: HEAD sha: %s", headSha)
@@ -521,7 +529,7 @@ func UnshallowGitRepository() (bool, error) {
 	}
 
 	if err != nil {
-		return false, fmt.Errorf("civisibility.unshallow: error: %s\n%s", err.Error(), fetchOutput)
+		return false, fmt.Errorf("civisibility.unshallow: error: %s\n%s", err, fetchOutput)
 	}
 
 	log.Debug("civisibility.unshallow: was completed successfully")
@@ -560,7 +568,7 @@ func GetGitDiff(baseCommit, headCommit string) (string, error) {
 	log.Debug("civisibility.git: getting the diff between %s and %s", baseCommit, headCommit)
 	out, err := execGitString(telemetry.DiffCommandType, "diff", "-U0", "--word-diff=porcelain", baseCommit, headCommit)
 	if err != nil {
-		return "", fmt.Errorf("civisibility.git: error getting the diff from %s to %s: %s | %s", baseCommit, headCommit, err.Error(), out)
+		return "", fmt.Errorf("civisibility.git: error getting the diff from %s to %s: %s | %s", baseCommit, headCommit, err, out)
 	}
 	if out == "" {
 		return "", fmt.Errorf("civisibility.git: error getting the diff from %s to %s: empty output", baseCommit, headCommit)
@@ -648,18 +656,38 @@ func CreatePackFiles(commitsToInclude []string, commitsToExclude []string) []str
 		objectsShasString += objectSha + "\n"
 	}
 
-	// get a temporary path to store the pack files
-	temporaryPath, err := os.MkdirTemp("", "pack-objects")
-	if err != nil {
-		log.Warn("civisibility: error creating temporary directory: %s", err.Error())
-		return nil
+	workingDirectory := func() string {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "."
+		}
+		return wd
 	}
 
-	// git pack-objects --compression=9 --max-pack-size={MaxPackFileSizeInMb}m "{temporaryPath}"
-	out, err := execGitStringWithInput(telemetry.PackObjectsCommandsType, objectsShasString,
-		"pack-objects", "--compression=9", "--max-pack-size="+strconv.Itoa(MaxPackFileSizeInMb)+"m", temporaryPath+"/")
+	var temporaryPath string
+	var out string
+	var err error
+
+	// Git can throw a cross device error if the temporal folder is in a different drive than the .git folder (eg. symbolic link)
+	// to handle this edge case, we first try with a temp folder and if we fail then we try in the working directory folder.
+	for _, folder := range []string{"", workingDirectory()} {
+		// get a temporary path to store the pack files
+		temporaryPath, err = os.MkdirTemp(folder, ".dd-pack-objects")
+		if err != nil {
+			log.Warn("civisibility: error creating temporary directory %s: %s", folder, err.Error())
+			continue
+		}
+
+		// git pack-objects --compression=9 --max-pack-size={MaxPackFileSizeInMb}m "{temporaryPath}"
+		out, err = execGitStringWithInput(telemetry.PackObjectsCommandsType, objectsShasString,
+			"pack-objects", "--compression=9", "--max-pack-size="+strconv.Itoa(MaxPackFileSizeInMb)+"m", temporaryPath+"/")
+		if err == nil {
+			break
+		}
+	}
+
 	if err != nil {
-		log.Warn("civisibility: error creating pack files: %s", err.Error())
+		log.Warn("civisibility: error creating pack files in %s: %s", temporaryPath, err.Error())
 		return nil
 	}
 
@@ -753,7 +781,7 @@ func findFallbackDefaultBranch(remoteName string) string {
 	return ""
 }
 
-// GetBaseBranchSha detects the base branch SHA using the algorithm from algorithm.md
+// GetBaseBranchSha detects the base branch SHA using the algorithm
 func GetBaseBranchSha(defaultBranch string) (string, error) {
 	if !isGitFound() {
 		return "", errors.New("git executable not found")

@@ -19,8 +19,10 @@ import (
 	"github.com/DataDog/dd-trace-go/v2/ddtrace/ext"
 	"github.com/DataDog/dd-trace-go/v2/ddtrace/internal/tracerstats"
 	sharedinternal "github.com/DataDog/dd-trace-go/v2/internal"
+	internalconfig "github.com/DataDog/dd-trace-go/v2/internal/config"
+	"github.com/DataDog/dd-trace-go/v2/internal/locking"
+	"github.com/DataDog/dd-trace-go/v2/internal/locking/assert"
 	"github.com/DataDog/dd-trace-go/v2/internal/log"
-	"github.com/DataDog/dd-trace-go/v2/internal/processtags"
 	"github.com/DataDog/dd-trace-go/v2/internal/samplernames"
 	"github.com/DataDog/dd-trace-go/v2/internal/telemetry"
 )
@@ -108,7 +110,7 @@ type SpanContext struct {
 	traceID traceID
 	spanID  uint64
 
-	mu         sync.RWMutex // guards below fields
+	mu         locking.RWMutex // guards below fields
 	baggage    map[string]string
 	hasBaggage uint32 // atomic int for quick checking presence of baggage. 0 indicates no baggage, otherwise baggage exists.
 	origin     string // e.g. "synthetics"
@@ -117,11 +119,16 @@ type SpanContext struct {
 	baggageOnly bool       // when true, indicates this context only propagates baggage items and should not be used for distributed tracing fields
 }
 
+// Private interface for span contexts that can propagate sampling decisions.
+type spanContextWithSamplingDecision interface {
+	SamplingDecision() uint32
+	Priority() *float64
+}
+
 // Private interface for converting v1 span contexts to v2 ones.
 type spanContextV1Adapter interface {
-	SamplingDecision() uint32
+	spanContextWithSamplingDecision
 	Origin() string
-	Priority() *float64
 	PropagatingTags() map[string]string
 	Tags() map[string]string
 }
@@ -138,14 +145,35 @@ func FromGenericCtx(c ddtrace.SpanContext) *SpanContext {
 		sc.baggage[k] = v
 		return true
 	})
+
+	ctxSpl, ok := c.(spanContextWithSamplingDecision)
+	if !ok {
+		return &sc
+	}
+
+	// If the generic context has a sampling decision, set it on the trace
+	// along with the priority if it exists.
+	// After setting the sampling decision, lock the trace so the decision is
+	// respected and avoid re-sampling.
+	if sDecision := samplingDecision(ctxSpl.SamplingDecision()); sDecision != decisionNone {
+		sc.trace = newTrace()
+		sc.trace.samplingDecision = sDecision
+
+		if p := ctxSpl.Priority(); p != nil {
+			sc.setSamplingPriority(int(*p), samplernames.Unknown)
+			sc.trace.setLocked(true)
+		}
+	}
+
 	ctx, ok := c.(spanContextV1Adapter)
 	if !ok {
 		return &sc
 	}
+
 	sc.origin = ctx.Origin()
-	sc.trace = newTrace()
-	sc.trace.priority = ctx.Priority()
-	sc.trace.samplingDecision = samplingDecision(ctx.SamplingDecision())
+	if sc.trace == nil {
+		sc.trace = newTrace()
+	}
 	sc.trace.tags = ctx.Tags()
 	sc.trace.propagatingTags = ctx.PropagatingTags()
 	return &sc
@@ -247,6 +275,17 @@ func (c *SpanContext) SpanLinks() []SpanLink {
 	return cp
 }
 
+// foreachBaggageItemLocked iterates over baggage items.
+// c.mu must be held for reading.
+func (c *SpanContext) foreachBaggageItemLocked(handler func(k, v string) bool) {
+	assert.RWMutexRLocked(&c.mu)
+	for k, v := range c.baggage {
+		if !handler(k, v) {
+			break
+		}
+	}
+}
+
 // ForeachBaggageItem implements ddtrace.SpanContext.
 func (c *SpanContext) ForeachBaggageItem(handler func(k, v string) bool) {
 	if c == nil {
@@ -257,11 +296,7 @@ func (c *SpanContext) ForeachBaggageItem(handler func(k, v string) bool) {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for k, v := range c.baggage {
-		if !handler(k, v) {
-			break
-		}
-	}
+	c.foreachBaggageItemLocked(handler)
 }
 
 // sets the sampling priority and decision maker (based on `sampler`).
@@ -275,6 +310,17 @@ func (c *SpanContext) setSamplingPriority(p int, sampler samplernames.SamplerNam
 	}
 }
 
+// forceSetSamplingPriority sets (and forces if the trace is locked) the sampling priority and decision maker (based on `sampler`).
+func (c *SpanContext) forceSetSamplingPriority(p int, sampler samplernames.SamplerName) {
+	if c.trace == nil {
+		c.trace = newTrace()
+	}
+	if c.trace.forceSetSamplingPriority(p, sampler) {
+		// the trace's sampling priority or sampler was updated: mark this as updated
+		c.updated = true
+	}
+}
+
 func (c *SpanContext) SamplingPriority() (p int, ok bool) {
 	if c == nil || c.trace == nil {
 		return 0, false
@@ -282,14 +328,35 @@ func (c *SpanContext) SamplingPriority() (p int, ok bool) {
 	return c.trace.samplingPriority()
 }
 
-func (c *SpanContext) setBaggageItem(key, val string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// setBaggageItemLocked sets a baggage item.
+// c.mu must be held for writing.
+func (c *SpanContext) setBaggageItemLocked(key, val string) {
+	assert.RWMutexLocked(&c.mu)
 	if c.baggage == nil {
 		atomic.StoreUint32(&c.hasBaggage, 1)
 		c.baggage = make(map[string]string, 1)
 	}
 	c.baggage[key] = val
+}
+
+func (c *SpanContext) setBaggageItem(key, val string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.setBaggageItemLocked(key, val)
+}
+
+// baggageItemLocked retrieves a baggage item.
+// c.mu must be held for reading.
+func (c *SpanContext) baggageItemLocked(key string) string {
+	assert.RWMutexRLocked(&c.mu)
+	return c.baggage[key]
+}
+
+// baggageCountLocked returns the number of baggage items.
+// c.mu must be held for reading.
+func (c *SpanContext) baggageCountLocked() int {
+	assert.RWMutexRLocked(&c.mu)
+	return len(c.baggage)
 }
 
 func (c *SpanContext) baggageItem(key string) string {
@@ -298,7 +365,7 @@ func (c *SpanContext) baggageItem(key string) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.baggage[key]
+	return c.baggageItemLocked(key)
 }
 
 // finish marks this span as finished in the trace.
@@ -315,7 +382,7 @@ func (c *SpanContext) safeDebugString() string {
 	var baggageCount int
 	if hasBaggage {
 		c.mu.RLock()
-		baggageCount = len(c.baggage)
+		baggageCount = c.baggageCountLocked()
 		c.mu.RUnlock()
 	}
 
@@ -362,12 +429,7 @@ var (
 	// reasonable as span is actually way bigger, and avoids re-allocating
 	// over and over. Could be fine-tuned at runtime.
 	traceStartSize = 10
-	// traceMaxSize is the maximum number of spans we keep in memory for a
-	// single trace. This is to avoid memory leaks. If more spans than this
-	// are added to a trace, then the trace is dropped and the spans are
-	// discarded. Adding additional spans after a trace is dropped does
-	// nothing.
-	traceMaxSize = int(1e5)
+	traceMaxSize   = internalconfig.TraceMaxSize
 )
 
 // newTrace creates a new trace using the given callback which will be called
@@ -397,6 +459,14 @@ func (t *trace) setSamplingPriority(p int, sampler samplernames.SamplerName) boo
 	return t.setSamplingPriorityLocked(p, sampler)
 }
 
+// forceSetSamplingPriority forces the sampling priority and the decision maker
+// and returns true if it was modified.
+func (t *trace) forceSetSamplingPriority(p int, sampler samplernames.SamplerName) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.setSamplingPriorityLockedWithForce(p, sampler, true)
+}
+
 func (t *trace) keep() {
 	atomic.CompareAndSwapUint32((*uint32)(&t.samplingDecision), uint32(decisionNone), uint32(decisionKeep))
 }
@@ -422,8 +492,13 @@ func samplerToDM(sampler samplernames.SamplerName) string {
 	return "-" + strconv.Itoa(int(sampler))
 }
 
-func (t *trace) setSamplingPriorityLocked(p int, sampler samplernames.SamplerName) bool {
-	if t.locked {
+// setSamplingPriority sets the sampling priority and the decision maker
+// and returns true if it was modified.
+//
+// The force parameter is used to bypass the locked sampling decision check
+// when setting the sampling priority. This is used to apply a manual keep or drop decision.
+func (t *trace) setSamplingPriorityLockedWithForce(p int, sampler samplernames.SamplerName, force bool) bool {
+	if t.locked && !force {
 		return false
 	}
 
@@ -454,6 +529,10 @@ func (t *trace) setSamplingPriorityLocked(p int, sampler samplernames.SamplerNam
 	}
 
 	return updatedPriority
+}
+
+func (t *trace) setSamplingPriorityLocked(p int, sampler samplernames.SamplerName) bool {
+	return t.setSamplingPriorityLockedWithForce(p, sampler, false)
 }
 
 func (t *trace) isLocked() bool {
@@ -511,9 +590,6 @@ func (t *trace) setTraceTags(s *Span) {
 	if s.context != nil && s.context.traceID.HasUpper() {
 		s.setMeta(keyTraceID128, s.context.traceID.UpperHex())
 	}
-	if pTags := processtags.GlobalTags().String(); pTags != "" {
-		s.setMeta(keyProcessTags, pTags)
-	}
 }
 
 // finishedOne acknowledges that another span in the trace has finished, and checks
@@ -540,7 +616,7 @@ func (t *trace) finishedOne(s *Span) {
 		return
 	}
 	tc := tr.TracerConf()
-	setPeerService(s, tc.PeerServiceDefaults, tc.PeerServiceMappings)
+	setPeerService(s, tc)
 
 	// attach the _dd.base_service tag only when the globally configured service name is different from the
 	// span service name.
@@ -597,10 +673,18 @@ func (t *trace) finishedOne(s *Span) {
 	}
 	telemetry.Distribution(telemetry.NamespaceTracers, "trace_partial_flush.spans_closed", nil).Submit(float64(len(finishedSpans)))
 	telemetry.Distribution(telemetry.NamespaceTracers, "trace_partial_flush.spans_remaining", nil).Submit(float64(len(leftoverSpans)))
-	finishedSpans[0].setMetric(keySamplingPriority, *t.priority)
+	// #incident-46344 -- if we set metrics and tags on a different span than what was passed into this function,
+	// we need to lock this new span.
+	fSpan := finishedSpans[0]
+	currentSpanIsFirstInChunk := s == fSpan
+	if !currentSpanIsFirstInChunk {
+		fSpan.mu.Lock()
+		defer fSpan.mu.Unlock()
+	}
+	fSpan.setMetric(keySamplingPriority, *t.priority)
 	if s != t.spans[0] {
 		// Make sure the first span in the chunk has the trace-level tags
-		t.setTraceTags(finishedSpans[0])
+		t.setTraceTags(fSpan)
 	}
 	if tr, ok := tr.(*tracer); ok {
 		t.finishChunk(tr, &chunk{
@@ -618,13 +702,24 @@ func (t *trace) finishChunk(tr *tracer, ch *chunk) {
 
 // setPeerService sets the peer.service, _dd.peer.service.source, and _dd.peer.service.remapped_from
 // tags as applicable for the given span.
-func setPeerService(s *Span, peerServiceDefaults bool, peerServiceMappings map[string]string) {
+func setPeerService(s *Span, tc TracerConf) {
+	spanKind := s.meta[ext.SpanKind]
+	isOutboundRequest := spanKind == ext.SpanKindClient || spanKind == ext.SpanKindProducer
+
 	if _, ok := s.meta[ext.PeerService]; ok { // peer.service already set on the span
 		s.setMeta(keyPeerServiceSource, ext.PeerService)
+	} else if isServerless(tc) {
+		// Set peerService only in outbound Lambda requests
+		if isOutboundRequest {
+			if ps := deriveAWSPeerService(s.meta); ps != "" {
+				s.setMeta(ext.PeerService, ps)
+				s.setMeta(keyPeerServiceSource, ext.PeerService)
+			} else {
+				log.Debug("Unable to set peer.service tag for serverless span %q", s.name)
+			}
+		}
 	} else { // no peer.service currently set
-		spanKind := s.meta[ext.SpanKind]
-		isOutboundRequest := spanKind == ext.SpanKindClient || spanKind == ext.SpanKindProducer
-		shouldSetDefaultPeerService := isOutboundRequest && peerServiceDefaults
+		shouldSetDefaultPeerService := isOutboundRequest && tc.PeerServiceDefaults
 		if !shouldSetDefaultPeerService {
 			return
 		}
@@ -637,10 +732,57 @@ func setPeerService(s *Span, peerServiceDefaults bool, peerServiceMappings map[s
 	}
 	// Overwrite existing peer.service value if remapped by the user
 	ps := s.meta[ext.PeerService]
-	if to, ok := peerServiceMappings[ps]; ok {
+	if to, ok := tc.PeerServiceMappings[ps]; ok {
 		s.setMeta(keyPeerServiceRemappedFrom, ps)
 		s.setMeta(ext.PeerService, to)
 	}
+}
+
+/*
+checks if we are in a serverless environment
+
+TODO add checks for Azure functions and other serverless environments
+*/
+func isServerless(tc TracerConf) bool {
+	return tc.isLambdaFunction
+}
+
+/*
+deriveAWSPeerService returns the host name of the
+outbound aws service call based on the span metadata,
+or an empty string if it cannot be determined.
+
+The mapping is as follows:
+  - eventbridge: events.<region>.amazonaws.com
+  - sqs:         sqs.<region>.amazonaws.com
+  - sns:         sns.<region>.amazonaws.com
+  - kinesis:     kinesis.<region>.amazonaws.com
+  - dynamodb:    dynamodb.<region>.amazonaws.com
+  - s3:          <bucket>.s3.<region>.amazonaws.com (if Bucket param present)
+    s3.<region>.amazonaws.com          (otherwise)
+*/
+func deriveAWSPeerService(sm map[string]string) string {
+	service, region := sm[ext.AWSService], sm[ext.AWSRegion]
+	if service == "" || region == "" {
+		return ""
+	}
+
+	s := strings.ToLower(service)
+	switch s {
+
+	case "s3":
+		if bucket := sm[ext.S3BucketName]; bucket != "" {
+			return bucket + ".s3." + region + ".amazonaws.com"
+		}
+		return "s3." + region + ".amazonaws.com"
+
+	case "eventbridge":
+		return "events." + region + ".amazonaws.com"
+
+	case "sqs", "sns", "dynamodb", "kinesis":
+		return s + "." + region + ".amazonaws.com"
+	}
+	return ""
 }
 
 // setPeerServiceFromSource sets peer.service from the sources determined
