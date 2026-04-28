@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/DataDog/dd-trace-go/v2/internal/civisibility/constants"
+	"github.com/DataDog/dd-trace-go/v2/internal/env"
 	"github.com/DataDog/dd-trace-go/v2/internal/log"
 	"github.com/DataDog/dd-trace-go/v2/internal/osinfo"
 )
@@ -57,9 +58,7 @@ func GetCITags() map[string]string {
 
 	// Create a new map with the added tags
 	newTags := maps.Clone(originalCiTags)
-	for k, v := range addedTags {
-		newTags[k] = v
-	}
+	maps.Copy(newTags, addedTags)
 
 	// Update the current tags
 	currentCiTags = newTags
@@ -94,9 +93,7 @@ func AddCITagsMap(tags map[string]string) {
 	if addedTags == nil {
 		addedTags = make(map[string]string)
 	}
-	for k, v := range tags {
-		addedTags[k] = v
-	}
+	maps.Copy(addedTags, tags)
 
 	// Reset the current tags
 	currentCiTags = nil
@@ -135,9 +132,7 @@ func GetCIMetrics() map[string]float64 {
 
 	// Create a new map with the added metrics
 	newMetrics := maps.Clone(originalCiMetrics)
-	for k, v := range addedMetrics {
-		newMetrics[k] = v
-	}
+	maps.Copy(newMetrics, addedMetrics)
 
 	// Update the current metrics
 	currentCiMetrics = newMetrics
@@ -172,9 +167,7 @@ func AddCIMetricsMap(metrics map[string]float64) {
 	if addedMetrics == nil {
 		addedMetrics = make(map[string]float64)
 	}
-	for k, v := range metrics {
-		addedMetrics[k] = v
-	}
+	maps.Copy(addedMetrics, metrics)
 
 	// Reset the current metrics
 	currentCiMetrics = nil
@@ -248,7 +241,7 @@ func createCITagsMap() map[string]string {
 	log.Debug("civisibility: test command: %s", cmd)
 
 	// Populate the test session name
-	if testSessionName, ok := os.LookupEnv(constants.CIVisibilityTestSessionNameEnvironmentVariable); ok {
+	if testSessionName, ok := env.Lookup(constants.CIVisibilityTestSessionNameEnvironmentVariable); ok {
 		localTags[constants.TestSessionName] = testSessionName
 	} else if jobName, ok := localTags[constants.CIJobName]; ok {
 		localTags[constants.TestSessionName] = fmt.Sprintf("%s-%s", jobName, cmd)
@@ -258,7 +251,7 @@ func createCITagsMap() map[string]string {
 	log.Debug("civisibility: test session name: %s", localTags[constants.TestSessionName])
 
 	// Check if the user provided the test service
-	if ddService := os.Getenv("DD_SERVICE"); ddService != "" {
+	if ddService := env.Get("DD_SERVICE"); ddService != "" {
 		localTags[constants.UserProvidedTestServiceTag] = "true"
 	} else {
 		localTags[constants.UserProvidedTestServiceTag] = "false"
@@ -309,7 +302,7 @@ func createCITagsMap() map[string]string {
 	// If the head commit SHA is available, populate additional Git head metadata
 	if headCommitSha, ok := localTags[constants.GitHeadCommit]; ok {
 		if headCommitData, err := fetchCommitData(headCommitSha); err != nil {
-			log.Warn("civisibility: failed to fetch head commit data: %s", err.Error())
+			log.Warn("civisibility: failed to fetch head commit data for %s: %s", headCommitSha, err.Error())
 		} else if headCommitSha == headCommitData.CommitSha {
 			localTags[constants.GitHeadAuthorDate] = headCommitData.AuthorDate.String()
 			localTags[constants.GitHeadAuthorName] = headCommitData.AuthorName
