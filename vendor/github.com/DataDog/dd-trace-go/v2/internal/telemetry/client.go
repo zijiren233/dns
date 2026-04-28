@@ -65,10 +65,8 @@ func newClient(tracerConfig internal.TracerConfig, config ClientConfig) (*client
 			skipAllowlist: config.Debug,
 			queueSize:     config.DistributionsSize,
 		},
-		logger: logger{
-			store:           xsync.NewMapOf[loggerKey, *loggerValue](),
-			maxDistinctLogs: config.MaxDistinctLogs,
-		},
+		appEndpoints: appEndpoints{isFirst: true},
+		backend:      newLoggerBackend(config.MaxDistinctLogs),
 	}
 
 	client.dataSources = append(client.dataSources,
@@ -76,10 +74,11 @@ func newClient(tracerConfig internal.TracerConfig, config ClientConfig) (*client
 		&client.products,
 		&client.configuration,
 		&client.dependencies,
+		&client.appEndpoints,
 	)
 
 	if config.LogsEnabled {
-		client.dataSources = append(client.dataSources, &client.logger)
+		client.dataSources = append(client.dataSources, client.backend)
 	}
 
 	if config.MetricsEnabled {
@@ -106,9 +105,10 @@ type client struct {
 	products      products
 	configuration configuration
 	dependencies  dependencies
-	logger        logger
+	backend       *loggerBackend
 	metrics       metrics
 	distributions distributions
+	appEndpoints  appEndpoints
 
 	// flushMapper is the transformer to use for the next flush on the gathered bodies on this tick
 	flushMapper   mapper.Mapper
@@ -116,6 +116,8 @@ type client struct {
 
 	// flushTicker is the ticker that triggers a call to client.Flush every flush interval
 	flushTicker *internal.Ticker
+	// flushMu is used to ensure that only one flush is happening at a time
+	flushMu sync.Mutex
 
 	// writer is the writer to use to send the payloads to the backend or the agent
 	writer internal.Writer
@@ -128,12 +130,12 @@ type client struct {
 	flushTickerFuncsMu sync.Mutex
 }
 
-func (c *client) Log(level LogLevel, text string, options ...LogOption) {
+func (c *client) Log(record Record, options ...LogOption) {
 	if !c.clientConfig.LogsEnabled {
 		return
 	}
 
-	c.logger.Add(level, text, options...)
+	c.backend.Add(record, options...)
 }
 
 func (c *client) MarkIntegrationAsLoaded(integration Integration) {
@@ -196,8 +198,21 @@ func (c *client) AddFlushTicker(f func(Client)) {
 	c.flushTickerFuncs = append(c.flushTickerFuncs, f)
 }
 
+func (c *client) callFlushTickerFuncs() {
+	c.flushTickerFuncsMu.Lock()
+	defer c.flushTickerFuncsMu.Unlock()
+
+	for _, f := range c.flushTickerFuncs {
+		f(c)
+	}
+}
+
 func (c *client) Config() ClientConfig {
 	return c.clientConfig
+}
+
+func (c *client) RegisterAppEndpoint(opName string, resName string, attrs AppEndpointAttributes) {
+	c.appEndpoints.Add(opName, resName, attrs)
 }
 
 // Flush sends all the data sources before calling flush
@@ -214,21 +229,14 @@ func (c *client) Flush() {
 		} else {
 			log.Warn("panic while flushing telemetry data, stopping telemetry!")
 		}
-		telemetryClientDisabled = true
+		telemetryClientEnabled = false
 		if gc, ok := GlobalClient().(*client); ok && gc == c {
 			SwapClient(nil)
 		}
 	}()
 
 	// We call the flushTickerFuncs before flushing the data for data sources
-	{
-		c.flushTickerFuncsMu.Lock()
-		defer c.flushTickerFuncsMu.Unlock()
-
-		for _, f := range c.flushTickerFuncs {
-			f(c)
-		}
-	}
+	c.callFlushTickerFuncs()
 
 	payloads := make([]transport.Payload, 0, 8)
 	for _, ds := range c.dataSources {
@@ -271,6 +279,8 @@ func (c *client) transform(payloads []transport.Payload) []transport.Payload {
 // flush sends all the data sources to the writer after having sent them through the [transform] function.
 // It returns the amount of bytes sent to the writer.
 func (c *client) flush(payloads []transport.Payload) (int, error) {
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
 	payloads = c.transform(payloads)
 
 	if c.payloadQueue.IsEmpty() && len(payloads) == 0 {
@@ -322,7 +332,7 @@ func (c *client) flush(payloads []transport.Payload) (int, error) {
 		for _, call := range failedCalls {
 			errs = append(errs, call.Error)
 		}
-		log.Debug("non-fatal error(s) while flushing telemetry data: %v", errors.Join(errs...).Error())
+		log.Debug("telemetry: non-fatal error(s) while flushing telemetry data: %v", errors.Join(errs...).Error())
 	}
 
 	return nbBytes, nil
